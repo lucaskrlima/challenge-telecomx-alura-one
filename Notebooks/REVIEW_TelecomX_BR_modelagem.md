@@ -1,111 +1,133 @@
 # Code Review — Notebook de Modelagem (`TelecomX_BR_modelagem.ipynb`)
 
 > Referência solicitada: link Colab informado pelo usuário.
-> Nesta execução, o acesso direto ao Colab não foi possível por bloqueio de rede (403). A revisão abaixo foi feita sobre o notebook equivalente presente no repositório local: `Notebooks/TelecomX_BR_modelagem.ipynb`.
+> Mesmo após a liberação, o acesso direto ao Colab neste ambiente continuou bloqueado por rede (`403 Forbidden` no túnel HTTP). A revisão abaixo foi feita sobre o notebook equivalente presente no repositório local: `Notebooks/TelecomX_BR_modelagem.ipynb`.
 
 ## Resumo executivo
-O notebook já está **bem acima de um baseline inicial**: possui pipeline com `ColumnTransformer`, validação cruzada estratificada, avaliação holdout e ajuste de threshold.
+O notebook já está **bem estruturado para baseline**: tem pipeline, validação cruzada, holdout e threshold.
 
-As melhorias prioritárias para elevar robustez e evitar viés otimista são:
-1. Evitar **retreino no conjunto de teste** durante busca de threshold.
-2. Adicionar **conjunto de validação** (ou CV interno) para seleção de threshold e hiperparâmetros.
-3. Tratar explicitamente categorias semânticas (`No internet service`/`No phone service`).
-4. Incluir **análise de calibragem** e métricas de negócio (ex.: top-k recall).
-5. Preparar o notebook para reuso em produção (funções, persistência do pipeline, tracking).
-
----
-
-## Pontos fortes
-- Ingestão robusta com `timeout` e `raise_for_status`.
-- Padronização de schema e checagem de colunas esperadas no rename.
-- Separação treino/teste estratificada e uso de pipeline para evitar leakage de transformação.
-- Métricas relevantes para churn: ROC-AUC, PR-AUC, Recall/F1/Precision.
-- Primeiro ajuste de threshold orientado por objetivo.
+Para tornar o modelo **utilizável (produção)**, as prioridades são:
+1. Remover viés de avaliação (não tunar threshold no teste).
+2. Congelar um artefato de inferência (`joblib`) com contrato de entrada.
+3. Definir monitoramento (drift + performance + dados inválidos).
+4. Criar rotina de re-treino e versionamento.
 
 ---
 
-## Melhorias recomendadas (priorizadas)
-
-## 1) Evitar vazamento por seleção de threshold no teste
-**Achado:** A função `avaliar_modelo` faz `fit` e avalia no teste; depois ela é reutilizada em loop de thresholds com o mesmo `X_test`, o que transforma o teste em conjunto de tuning.
-
-**Risco:** métrica final otimista e baixa generalização.
-
-**Sugestão:**
-- dividir treino em `train/valid` (ou usar CV interno) para escolher threshold;
-- manter `test` apenas para avaliação única final.
+## O que está bom
+- Ingestão com timeout e validação HTTP.
+- Padronização de schema com validação de chaves de rename.
+- `ColumnTransformer` + `Pipeline` evitando leakage de transformação.
+- Avaliação com métricas coerentes para churn (ROC-AUC, PR-AUC, recall/f1).
 
 ---
 
-## 2) Separar função de treino e função de avaliação
-**Achado:** `avaliar_modelo` chama `pipe.fit(...)` toda vez.
+## Achados e melhorias para deixar o modelo utilizável
 
-**Risco:** retreino desnecessário, custo computacional maior e risco de uso incorreto em etapas de seleção.
+## 1) Corrigir seleção de threshold (ponto crítico)
+**Achado:** o threshold está sendo escolhido com base no `X_test`.
 
-**Sugestão:**
-- `treinar_modelo(pipe, X_train, y_train)` retorna pipeline fitado;
-- `avaliar_modelo(pipe_fitado, X, y, threshold)` apenas mede desempenho.
+**Impacto:** performance otimista e risco de queda forte em produção.
 
----
-
-## 3) Categorias semânticas ambíguas
-**Achado:** O dataset clássico de churn traz valores como `No internet service` e `No phone service`.
-
-**Risco:** one-hot pode capturar semântica inconsistente entre variáveis relacionadas.
-
-**Sugestão:**
-- padronizar categorias com mapeamento explícito (`sem_internet`, `sem_telefone`, `nao`, `sim`);
-- registrar esse mapeamento em uma célula de regras de negócio.
+**Melhoria:**
+- usar `train/valid/test`;
+- tunar threshold só no `valid`;
+- rodar `test` apenas 1 vez no final.
 
 ---
 
-## 4) Tratar desbalanceamento de forma mais orientada a negócio
-**Achado:** `RandomForest` usa `class_weight='balanced_subsample'`, mas `LogisticRegression` não usa balanceamento.
+## 2) Separar treino e avaliação
+**Achado:** a função de avaliação chama `fit` toda vez.
 
-**Sugestão:**
-- testar `class_weight='balanced'` também na regressão logística;
-- comparar impacto em Recall e PR-AUC;
-- escolher threshold com base em custo de retenção (FN x FP), não apenas melhor F1.
+**Impacto:** retreino repetido, difícil rastreabilidade e maior chance de erro no fluxo.
 
----
-
-## 5) Adicionar calibração de probabilidade
-**Achado:** threshold depende da qualidade das probabilidades estimadas.
-
-**Sugestão:**
-- comparar modelo calibrado (`CalibratedClassifierCV`) vs não calibrado;
-- medir Brier score e curva de calibração.
+**Melhoria:**
+- `treinar_modelo()` retorna pipeline fitado;
+- `avaliar_modelo()` apenas calcula métricas com modelo já treinado.
 
 ---
 
-## 6) Expandir avaliação além de métricas médias
-**Achado:** CV reporta média apenas.
+## 3) Definir contrato de entrada (schema) para inferência
+**Achado:** não existe validação formal de colunas/tipos na hora de prever.
 
-**Sugestão:**
-- incluir desvio-padrão e intervalo (mín/máx) por métrica;
-- mostrar matriz de confusão normalizada e curva PR/ROC no holdout.
+**Impacto:** payload quebrado em produção (coluna faltando, tipo errado, categoria inesperada).
 
----
-
-## 7) Engenharia de atributos e consistência temporal
-**Achado:** boas features derivadas já existem, mas faltam verificações de estabilidade.
-
-**Sugestão:**
-- testar bucketização de `meses_contrato`;
-- monitorar drift de distribuição por período (quando houver snapshots);
-- validar importância de features por permutation importance/SHAP (baseline).
+**Melhoria:**
+- criar schema (ex.: `pydantic`/`pandera`) com tipos esperados;
+- validar entrada antes de `predict_proba`;
+- logar taxa de registros rejeitados.
 
 ---
 
-## 8) Reprodutibilidade e entrega para produção
-**Sugestão:**
-- encapsular em funções (`carregar`, `preparar`, `treinar`, `avaliar`);
-- exportar pipeline final com `joblib`;
-- registrar versão de dependências (`requirements.txt`/`pyproject`).
+## 4) Persistir artefatos e versão de modelo
+**Achado:** notebook treina, mas não salva modelo final para uso externo.
 
-## Checklist prático (próxima iteração)
-- [ ] Criar split `train/valid/test`.
-- [ ] Selecionar threshold no `valid` e congelar para `test`.
-- [ ] Adicionar `class_weight='balanced'` para Logistic Regression e comparar.
-- [ ] Adicionar curvas ROC/PR + calibração.
-- [ ] Persistir pipeline vencedor e gerar artefato de inferência.
+**Impacto:** impossível usar de forma estável em API/batch sem retraining manual.
+
+**Melhoria:**
+- salvar `pipeline_final.joblib`;
+- salvar `metadata.json` com versão, data, métricas, threshold e features;
+- manter versionamento (ex.: `model_registry/telecomx_churn/v1`).
+
+---
+
+## 5) Estratégia de decisão orientada a negócio
+**Achado:** threshold otimizado por F1 apenas.
+
+**Impacto:** pode não refletir melhor resultado de retenção (custo de contato vs churn evitado).
+
+**Melhoria:**
+- construir função de custo (FP/FN);
+- selecionar threshold por valor esperado de negócio;
+- reportar `recall@top_k` (ex.: top 10% clientes de maior risco).
+
+---
+
+## 6) Calibração de probabilidade
+**Achado:** probabilidades não são checadas quanto à calibração.
+
+**Impacto:** ranking de risco pode ficar distorcido para priorização de campanhas.
+
+**Melhoria:**
+- comparar modelo calibrado (`CalibratedClassifierCV`);
+- adicionar Brier Score + curva de calibração.
+
+---
+
+## 7) Monitoramento pós-deploy (obrigatório para uso real)
+**Melhoria mínima:**
+- monitorar drift de variáveis (PSI/KS simples);
+- monitorar taxa de churn prevista e distribuição de scores;
+- monitorar qualidade de dados (nulos, categorias novas, ranges inválidos);
+- monitorar performance quando rótulo real chegar (AUC/Recall por safra).
+
+---
+
+## 8) Reprodutibilidade operacional
+**Melhoria:**
+- extrair o notebook para módulos `.py` (`data.py`, `features.py`, `train.py`, `predict.py`);
+- criar `requirements.txt` com versões fixas;
+- script único de treino (`python train.py`) e inferência batch (`python predict.py --input ...`).
+
+---
+
+## 9) Governança e explicabilidade
+**Melhoria:**
+- guardar importâncias (permutation importance / SHAP);
+- registrar por que clientes são classificados com alto risco;
+- documentar limitações e risco de viés (ex.: variáveis sensíveis).
+
+## Plano prático (7 dias) para “modelo utilizável”
+1. **Dia 1-2:** refatorar split `train/valid/test`, congelar threshold no `valid`.
+2. **Dia 3:** persistir `joblib` + `metadata.json` + schema de entrada.
+3. **Dia 4:** criar script `predict.py` (batch CSV -> score + decisão).
+4. **Dia 5:** implementar monitoramento básico de drift e qualidade de dados.
+5. **Dia 6-7:** validar com amostra real, ajustar threshold por custo e publicar v1.
+
+## Checklist de prontidão para produção
+- [ ] Modelo salvo e versionado.
+- [ ] Threshold fixado fora do teste.
+- [ ] Contrato de entrada validado automaticamente.
+- [ ] Pipeline de inferência reproduzível em script.
+- [ ] Monitoramento de dados e score em execução.
+- [ ] Procedimento de re-treino documentado.
